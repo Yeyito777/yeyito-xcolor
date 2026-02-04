@@ -86,6 +86,17 @@ fn escape_keycode(conn: &Connection) -> Result<u8> {
     }
 }
 
+fn return_keycode(conn: &Connection) -> Result<u8> {
+    let keycode =
+        unsafe { xlib::XKeysymToKeycode(conn.get_raw_dpy(), keysym::XK_Return as xlib::KeySym) };
+
+    if keycode == 0 {
+        Err(anyhow!("Could not resolve the Return keycode"))
+    } else {
+        Ok(keycode as u8)
+    }
+}
+
 // Updates the cursor for an _already grabbed pointer_
 fn update_cursor(conn: &Connection, cursor: u32) -> Result<()> {
     xproto::change_active_pointer_grab_checked(conn, cursor, xbase::CURRENT_TIME, GRAB_MASK)
@@ -101,7 +112,7 @@ fn create_new_xcursor(
     preview_width: u32,
 ) -> Result<u32> {
     Ok(unsafe {
-        let mut cursor_image = XcursorImageCreate(preview_width as i32, preview_width as i32);
+        let cursor_image = XcursorImageCreate(preview_width as i32, preview_width as i32);
 
         // set the "hot spot" - this is where the pointer actually is inside the image
         (*cursor_image).xhot = preview_width / 2;
@@ -225,6 +236,7 @@ pub fn wait_for_location(
     let root = screen.root();
     let preview_width = preview_width.ensure_odd();
     let escape_keycode = escape_keycode(conn)?;
+    let return_keycode = return_keycode(conn)?;
 
     // grab the cursor to listen to all of its events
     let mut cursor = create_new_cursor(conn, screen, preview_width, scale, None)?;
@@ -254,6 +266,14 @@ pub fn wait_for_location(
                     let event: &xproto::KeyPressEvent = unsafe { xbase::cast_event(&event) };
                     if event.detail() == escape_keycode {
                         break None;
+                    } else if event.detail() == return_keycode {
+                        let pointer = xproto::query_pointer(conn, root).get_reply()?;
+                        let pixels = color::window_rect(
+                            conn,
+                            root,
+                            (pointer.root_x(), pointer.root_y(), 1, 1),
+                        )?;
+                        break Some(pixels[0]);
                     }
                 }
                 xproto::MOTION_NOTIFY => {
