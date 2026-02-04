@@ -1,5 +1,12 @@
 use anyhow::{anyhow, Result};
-use x11::xcursor::{XcursorImageCreate, XcursorImageDestroy, XcursorImageLoadCursor};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use x11::{
+    keysym,
+    xcursor::{XcursorImageCreate, XcursorImageDestroy, XcursorImageLoadCursor},
+    xlib,
+};
 use xcb::base as xbase;
 use xcb::base::Connection;
 use xcb::xproto;
@@ -12,6 +19,8 @@ use crate::util::EnsureOdd;
 // Left mouse button
 const SELECTION_BUTTON: xproto::Button = 1;
 const GRAB_MASK: u16 = (xproto::EVENT_MASK_BUTTON_PRESS | xproto::EVENT_MASK_POINTER_MOTION) as u16;
+const KEYBOARD_GRAB_TIMEOUT: Duration = Duration::from_secs(1);
+const KEYBOARD_GRAB_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 // Exclusively grabs the pointer so we get all its events
 fn grab_pointer(conn: &Connection, root: u32, cursor: u32) -> Result<()> {
@@ -33,6 +42,48 @@ fn grab_pointer(conn: &Connection, root: u32, cursor: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Aggressively tries to grab the keyboard so we can listen for ESC to exit
+fn grab_keyboard_with_retry(conn: &Connection, root: u32) -> Result<()> {
+    let start = Instant::now();
+
+    loop {
+        let reply = xproto::grab_keyboard(
+            conn,
+            false,
+            root,
+            xbase::CURRENT_TIME,
+            xproto::GRAB_MODE_ASYNC as u8,
+            xproto::GRAB_MODE_ASYNC as u8,
+        )
+        .get_reply()?;
+
+        if reply.status() == xproto::GRAB_STATUS_SUCCESS as u8 {
+            return Ok(());
+        }
+
+        if start.elapsed() >= KEYBOARD_GRAB_TIMEOUT {
+            break;
+        }
+
+        thread::sleep(KEYBOARD_GRAB_RETRY_DELAY);
+    }
+
+    Err(anyhow!(
+        "Could not grab keyboard for escape detection after repeated attempts"
+    ))
+}
+
+fn escape_keycode(conn: &Connection) -> Result<u8> {
+    let keycode =
+        unsafe { xlib::XKeysymToKeycode(conn.get_raw_dpy(), keysym::XK_Escape as xlib::KeySym) };
+
+    if keycode == 0 {
+        Err(anyhow!("Could not resolve the Escape keycode"))
+    } else {
+        Ok(keycode as u8)
+    }
 }
 
 // Updates the cursor for an _already grabbed pointer_
@@ -173,10 +224,12 @@ pub fn wait_for_location(
 ) -> Result<Option<ARGB>> {
     let root = screen.root();
     let preview_width = preview_width.ensure_odd();
+    let escape_keycode = escape_keycode(conn)?;
 
     // grab the cursor to listen to all of its events
     let mut cursor = create_new_cursor(conn, screen, preview_width, scale, None)?;
     grab_pointer(conn, root, cursor)?;
+    grab_keyboard_with_retry(conn, root)?;
 
     let result = loop {
         let event = conn.wait_for_event();
@@ -195,6 +248,12 @@ pub fn wait_for_location(
                             break Some(pixels[0]);
                         }
                         _ => {}
+                    }
+                }
+                xproto::KEY_PRESS => {
+                    let event: &xproto::KeyPressEvent = unsafe { xbase::cast_event(&event) };
+                    if event.detail() == escape_keycode {
+                        break None;
                     }
                 }
                 xproto::MOTION_NOTIFY => {
@@ -218,6 +277,7 @@ pub fn wait_for_location(
         }
     };
 
+    xproto::ungrab_keyboard(conn, xbase::CURRENT_TIME);
     xproto::ungrab_pointer(conn, xbase::CURRENT_TIME);
     xproto::free_cursor(conn, cursor);
     conn.flush();
