@@ -14,10 +14,12 @@ use crate::util::EnsureOdd;
 
 // Left mouse button
 const SELECTION_BUTTON: xproto::Button = 1;
-const GRAB_MASK: u16 = (xproto::EVENT_MASK_BUTTON_PRESS | xproto::EVENT_MASK_POINTER_MOTION) as u16;
+const PICKER_EVENT_MASK: u32 = (xproto::EVENT_MASK_BUTTON_PRESS
+    | xproto::EVENT_MASK_POINTER_MOTION
+    | xproto::EVENT_MASK_KEY_PRESS) as u32;
 
 // Creates an invisible 1x1 cursor using pure XCB (no Xlib). Used to hide the real cursor
-// during the pointer grab while the magnifier window is shown.
+// while the picker overlay is active.
 fn create_blank_cursor(conn: &Connection, screen: &xproto::Screen) -> Result<u32> {
     let cursor_id = conn.generate_id();
     let pixmap_id = conn.generate_id();
@@ -41,60 +43,70 @@ fn create_blank_cursor(conn: &Connection, screen: &xproto::Screen) -> Result<u32
     Ok(cursor_id)
 }
 
-const KEYBOARD_GRAB_TIMEOUT: Duration = Duration::from_secs(1);
-const KEYBOARD_GRAB_RETRY_DELAY: Duration = Duration::from_millis(5);
+const FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
+const FOCUS_RETRY_DELAY: Duration = Duration::from_millis(5);
 
-// Exclusively grabs the pointer so we get all its events
-fn grab_pointer(conn: &Connection, root: u32, cursor: u32) -> Result<()> {
-    let reply = xproto::grab_pointer(
+// Creates a fullscreen invisible input window that captures pointer and key
+// events without taking an active X grab. This keeps global hotkeys usable
+// while the picker is active.
+fn create_input_window(conn: &Connection, screen: &xproto::Screen, cursor: u32) -> Result<u32> {
+    let win = conn.generate_id();
+
+    xproto::create_window(
         conn,
-        false,
-        root,
-        GRAB_MASK,
-        xproto::GRAB_MODE_ASYNC as u8,
-        xproto::GRAB_MODE_ASYNC as u8,
-        xbase::NONE,
-        cursor,
-        xbase::CURRENT_TIME,
+        0,
+        win,
+        screen.root(),
+        0,
+        0,
+        screen.width_in_pixels(),
+        screen.height_in_pixels(),
+        0,
+        xproto::WINDOW_CLASS_INPUT_ONLY as u16,
+        xbase::COPY_FROM_PARENT,
+        &[
+            (xproto::CW_OVERRIDE_REDIRECT, 1),
+            (xproto::CW_EVENT_MASK, PICKER_EVENT_MASK),
+            (xproto::CW_CURSOR, cursor),
+        ],
     )
-    .get_reply()?;
+    .request_check()?;
 
-    if reply.status() != xproto::GRAB_STATUS_SUCCESS as u8 {
-        return Err(anyhow!("Could not grab pointer"));
-    }
+    xproto::map_window(conn, win).request_check()?;
+    conn.flush();
 
-    Ok(())
+    Ok(win)
 }
 
-// Aggressively tries to grab the keyboard so we can listen for ESC to exit
-fn grab_keyboard_with_retry(conn: &Connection, root: u32) -> Result<()> {
+// Focus the input overlay so ESC and Enter work, but without monopolizing the
+// keyboard through an active grab.
+fn focus_input_window(conn: &Connection, win: u32) -> Result<()> {
     let start = Instant::now();
 
     loop {
-        let reply = xproto::grab_keyboard(
+        xproto::set_input_focus(
             conn,
-            false,
-            root,
+            xproto::INPUT_FOCUS_POINTER_ROOT as u8,
+            win,
             xbase::CURRENT_TIME,
-            xproto::GRAB_MODE_ASYNC as u8,
-            xproto::GRAB_MODE_ASYNC as u8,
         )
-        .get_reply()?;
+        .request_check()?;
+        conn.flush();
 
-        if reply.status() == xproto::GRAB_STATUS_SUCCESS as u8 {
-            return Ok(());
+        if let Ok(reply) = xproto::get_input_focus(conn).get_reply() {
+            if reply.focus() == win {
+                return Ok(());
+            }
         }
 
-        if start.elapsed() >= KEYBOARD_GRAB_TIMEOUT {
+        if start.elapsed() >= FOCUS_TIMEOUT {
             break;
         }
 
-        thread::sleep(KEYBOARD_GRAB_RETRY_DELAY);
+        thread::sleep(FOCUS_RETRY_DELAY);
     }
 
-    Err(anyhow!(
-        "Could not grab keyboard for escape detection after repeated attempts"
-    ))
+    Err(anyhow!("Could not focus picker window"))
 }
 
 fn escape_keycode(conn: &Connection) -> Result<u8> {
@@ -237,15 +249,11 @@ pub fn wait_for_location(
     let escape_keycode = escape_keycode(conn)?;
     let return_keycode = return_keycode(conn)?;
 
-    // Grab with an invisible cursor (hides real cursor, captures events)
     let blank_cursor = create_blank_cursor(conn, screen)?;
-    grab_pointer(conn, root, blank_cursor)?;
 
-    // Take a full-screen screenshot while our magnifier window does not exist yet.
-    // This cache is used for all magnifier rendering, avoiding the compositor
-    // synchronization problem: get_image on root during the event loop would read
-    // the compositor's framebuffer which still contains our own magnifier pixels,
-    // causing a hall-of-mirrors effect.
+    // Take a full-screen screenshot before we create any picker windows. This
+    // cache is used for all magnifier rendering, avoiding compositor feedback
+    // and preserving the user's screenshot-based magnifier behavior.
     let root_width = screen.width_in_pixels();
     let root_height = screen.height_in_pixels();
     let screenshot_cache = color::window_rect(conn, root, (0, 0, root_width, root_height))?;
@@ -268,9 +276,9 @@ pub fn wait_for_location(
     let pointer = xproto::query_pointer(conn, root).get_reply()?;
     let initial_point = (pointer.root_x(), pointer.root_y());
 
-    // Create override-redirect ARGB window OFF-SCREEN. We map the window immediately
-    // and keep it mapped for its entire lifetime — some X servers / compositors discard
-    // a window's pixel buffer while it is unmapped, so put_image data would be lost.
+    // Create override-redirect ARGB magnifier window off-screen. We keep it
+    // mapped for its whole lifetime so the server/compositor retains its pixel
+    // buffer.
     let win = conn.generate_id();
     let win_size = preview_width as u16;
     xproto::create_window(
@@ -293,15 +301,22 @@ pub fn wait_for_location(
         ],
     );
 
-    // Create GC for the window
+    // Set WM_CLASS so compositors (picom) can identify this window
+    xproto::change_property(
+        conn,
+        xproto::PROP_MODE_REPLACE as u8,
+        win,
+        xproto::ATOM_WM_CLASS,
+        xproto::ATOM_STRING,
+        8,
+        b"xcolor\0xcolor\0",
+    );
+
     let gc = conn.generate_id();
     xproto::create_gc(conn, gc, win, &[]);
-
-    // Map window off-screen so the server allocates its pixel buffer
     xproto::map_window(conn, win);
     conn.flush();
 
-    // Render initial magnifier from cache and paint into the now-mapped window
     let pixels = render_magnifier_from_cache(
         &screenshot_cache,
         root_width,
@@ -324,7 +339,6 @@ pub fn wait_for_location(
         pixels_as_bytes(&pixels),
     );
 
-    // Move window on-screen centered on cursor
     let win_x = initial_point.0 - (win_size as i16) / 2;
     let win_y = initial_point.1 - (win_size as i16) / 2;
     xproto::configure_window(
@@ -336,12 +350,16 @@ pub fn wait_for_location(
         ],
     );
     conn.flush();
-    grab_keyboard_with_retry(conn, root)?;
+
+    // Create the invisible fullscreen input layer after the magnifier so it
+    // stays on top for event delivery while remaining visually transparent.
+    let input_win = create_input_window(conn, screen, blank_cursor)?;
+    focus_input_window(conn, input_win)?;
 
     let result = loop {
         let event = conn.wait_for_event();
         if let Some(event) = event {
-            match event.response_type() {
+            match event.response_type() & !0x80 {
                 xproto::BUTTON_PRESS => {
                     let event: &xproto::ButtonPressEvent = unsafe { xbase::cast_event(&event) };
                     match event.detail() {
@@ -353,7 +371,7 @@ pub fn wait_for_location(
                                 .min(root_height as usize - 1);
                             break Some(screenshot_cache[y * root_width as usize + x]);
                         }
-                        _ => {}
+                        _ => break None,
                     }
                 }
                 xproto::KEY_PRESS => {
@@ -374,7 +392,6 @@ pub fn wait_for_location(
                         unsafe { xbase::cast_event(&event) };
                     let point = (event.root_x(), event.root_y());
 
-                    // Render from cache — pure CPU, no compositor interaction
                     let pixels = render_magnifier_from_cache(
                         &screenshot_cache,
                         root_width,
@@ -384,7 +401,6 @@ pub fn wait_for_location(
                         scale,
                     );
 
-                    // Update window content and position
                     let new_x = point.0 - (win_size as i16) / 2;
                     let new_y = point.1 - (win_size as i16) / 2;
                     xproto::put_image(
@@ -418,12 +434,11 @@ pub fn wait_for_location(
     };
 
     // Cleanup
+    xproto::destroy_window(conn, input_win).request_check()?;
     xproto::unmap_window(conn, win);
     xproto::destroy_window(conn, win);
     xproto::free_gc(conn, gc);
     xproto::free_colormap(conn, colormap);
-    xproto::ungrab_keyboard(conn, xbase::CURRENT_TIME);
-    xproto::ungrab_pointer(conn, xbase::CURRENT_TIME);
     xproto::free_cursor(conn, blank_cursor);
     conn.flush();
 
