@@ -45,6 +45,22 @@ fn create_blank_cursor(conn: &Connection, screen: &xproto::Screen) -> Result<u32
 
 const FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
 const FOCUS_RETRY_DELAY: Duration = Duration::from_millis(5);
+const WM_CLASS: &[u8] = b"xcolor\0xcolor\0";
+
+fn set_xcolor_wm_class(conn: &Connection, win: xproto::Window) -> Result<()> {
+    xproto::change_property(
+        conn,
+        xproto::PROP_MODE_REPLACE as u8,
+        win,
+        xproto::ATOM_WM_CLASS,
+        xproto::ATOM_STRING,
+        8,
+        WM_CLASS,
+    )
+    .request_check()?;
+
+    Ok(())
+}
 
 // Creates a fullscreen invisible input window that captures pointer and key
 // events without taking an active X grab. This keeps global hotkeys usable
@@ -71,6 +87,8 @@ fn create_input_window(conn: &Connection, screen: &xproto::Screen, cursor: u32) 
         ],
     )
     .request_check()?;
+
+    set_xcolor_wm_class(conn, win)?;
 
     xproto::map_window(conn, win).request_check()?;
     conn.flush();
