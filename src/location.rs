@@ -127,6 +127,32 @@ fn focus_input_window(conn: &Connection, win: u32) -> Result<()> {
     Err(anyhow!("Could not focus picker window"))
 }
 
+fn saved_input_focus(conn: &Connection) -> Option<u32> {
+    xproto::get_input_focus(conn)
+        .get_reply()
+        .ok()
+        .map(|reply| reply.focus())
+}
+
+fn restore_input_focus(conn: &Connection, saved_focus: Option<u32>, input_win: u32, picker_win: u32) {
+    let Some(saved_focus) = saved_focus else {
+        return;
+    };
+
+    if saved_focus == 0 || saved_focus == 1 || saved_focus == input_win || saved_focus == picker_win {
+        return;
+    }
+
+    let _ = xproto::set_input_focus(
+        conn,
+        xproto::INPUT_FOCUS_POINTER_ROOT as u8,
+        saved_focus,
+        xbase::CURRENT_TIME,
+    )
+    .request_check();
+    conn.flush();
+}
+
 fn escape_keycode(conn: &Connection) -> Result<u8> {
     let keycode =
         unsafe { xlib::XKeysymToKeycode(conn.get_raw_dpy(), keysym::XK_Escape as xlib::KeySym) };
@@ -372,6 +398,7 @@ pub fn wait_for_location(
     // Create the invisible fullscreen input layer after the magnifier so it
     // stays on top for event delivery while remaining visually transparent.
     let input_win = create_input_window(conn, screen, blank_cursor)?;
+    let saved_focus = saved_input_focus(conn);
     focus_input_window(conn, input_win)?;
 
     let result = loop {
@@ -459,6 +486,7 @@ pub fn wait_for_location(
     xproto::free_colormap(conn, colormap);
     xproto::free_cursor(conn, blank_cursor);
     conn.flush();
+    restore_input_focus(conn, saved_focus, input_win, win);
 
     Ok(result)
 }
